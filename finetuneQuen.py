@@ -6,6 +6,8 @@ from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from datasets import load_dataset
 from tqdm.auto import tqdm
 import numpy as np
+import os
+from torch.cuda.amp import GradScaler, autocast
 
 # Assuming KronA is implemented in a separate file
 from KornA import KronABres
@@ -232,10 +234,12 @@ def tokenize_data(dataset, tokenizer):
 
 
 # Fine-tune the model with progress bar and better error handling
-def fine_tune_model(model, train_dataloader, optimizer, num_epochs=3, lr_scheduler=None):
+def fine_tune_model(model, train_dataloader, optimizer, num_epochs=3, lr_scheduler=None, accumulation_steps=4):
     device = next(model.parameters()).device
+    scaler = torch.amp.GradScaler('cuda')  # For mixed precision training
     
     for epoch in range(num_epochs):
+        torch.cuda.empty_cache() 
         model.train()
         total_loss = 0
         num_batches = 0
@@ -243,49 +247,51 @@ def fine_tune_model(model, train_dataloader, optimizer, num_epochs=3, lr_schedul
         # Create progress bar
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
-        for batch in progress_bar:
+        optimizer.zero_grad()  # Reset gradients
+        
+        for step, batch in enumerate(progress_bar):
             try:
                 # Move all tensors to device
                 batch = {k: v.to(device) for k, v in batch.items()}
                 
-                # Forward pass
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"]
-                )
+                # Forward pass with mixed precision
+                with autocast():
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"]
+                    )
+                    loss = outputs.loss / accumulation_steps  # Scale loss for gradient accumulation
                 
-                loss = outputs.loss
+                # Backward pass
+                scaler.scale(loss).backward()
                 
-                # Backward pass and optimization
-                optimizer.zero_grad()
-                loss.backward()
-                
-                # Apply gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
+                # Update weights after accumulation steps
+                if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_dataloader):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
                 
                 # Update metrics
-                total_loss += loss.item()
+                total_loss += loss.item() * accumulation_steps
                 num_batches += 1
                 
                 # Update progress bar
-                progress_bar.set_postfix({"loss": loss.item()})
+                progress_bar.set_postfix({"loss": loss.item() * accumulation_steps})
                 
             except Exception as e:
                 print(f"Error processing batch: {e}")
                 continue
-        
+        torch.cuda.empty_cache()
         # Print epoch results
         avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
         print(f"Epoch {epoch + 1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
 
 
+
 # Main script
-import os  # Import os to check for existing checkpoints
 
 if __name__ == "__main__":
     # Set random seed for reproducibility
