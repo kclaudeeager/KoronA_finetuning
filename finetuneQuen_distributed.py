@@ -44,8 +44,29 @@ class ModelWithKronABres(nn.Module):
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         return {"loss": loss, "logits": final_logits} if return_dict else (loss, final_logits)
+    # Add save_pretrained method
+    def save_pretrained(self, path):
+        # Save the base model
+        self.base_model.save_pretrained(path)
+        # Save KronABres parameters separately
+        kronabres_state = self.kronabres.state_dict()
+        torch.save(kronabres_state, f"{path}/kronabres_adapter.pt")
 
-
+    @classmethod
+    def from_pretrained(cls, path, base_model_name, hidden_dim, a1=48, a2=32, scale=1.0, dropout=0.1):
+        # Load the base model
+        base_model = AutoModelForCausalLM.from_pretrained(path)
+        # Initialize the model
+        model = cls(base_model, hidden_dim, a1, a2, scale, dropout)
+        # Load KronABres parameters if available
+        kronabres_path = f"{path}/kronabres_adapter.pt"
+        if os.path.exists(kronabres_path):
+            kronabres_state = torch.load(kronabres_path, map_location=torch.device('cpu'))
+            model.kronabres.load_state_dict(kronabres_state)
+        else:
+            print(f"Warning: {kronabres_path} not found. KronABres adapter will be randomly initialized.")
+        return model
+    
 
 def setup_logging(rank):
     logging.basicConfig(
@@ -219,7 +240,7 @@ def distributed_fine_tune(rank, world_size, model_name, output_path):
         model = model.to(rank)
         model = DistributedDataParallel(model, device_ids=[rank])
 
-        meta_train_data, meta_valid_data = load_and_preprocess_dataset("meta-math/MetaMathQA", sample_size=20000 // world_size)
+        meta_train_data, meta_valid_data = load_and_preprocess_dataset("meta-math/MetaMathQA", sample_size=300000 // world_size)
         gsm_train_data, gsm_valid_data = load_and_preprocess_dataset("gsm8k")
 
         meta_train_tokenized = tokenize_data(meta_train_data, tokenizer)
@@ -238,6 +259,7 @@ def distributed_fine_tune(rank, world_size, model_name, output_path):
         scaler = torch.amp.GradScaler('cuda') 
 
         def train_epoch(dataloader, num_epochs):
+            logging.info(f"Training for {num_epochs} epochs")
             for epoch in range(num_epochs):
                 dataloader.sampler.set_epoch(epoch)
                 model.train()
@@ -253,19 +275,25 @@ def distributed_fine_tune(rank, world_size, model_name, output_path):
                     scaler.update()
                     lr_scheduler.step()
                     total_loss += loss.item()
+                    
+                    # Log progress for every 10 batches
+                    if step % 10 == 0:
+                        logging.info(f"Rank {rank} - Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}")
+                
                 avg_loss = total_loss / len(dataloader)
                 dist.all_reduce(torch.tensor(avg_loss, device=rank), op=dist.ReduceOp.SUM)
                 if rank == 0:
-                    print(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
+                    logging.info(f"Epoch {epoch+1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
 
         train_epoch(meta_train_dataloader, num_epochs=3)
         train_epoch(gsm_train_dataloader, num_epochs=1)
 
         if rank == 0:
+            logging.info(f"Saving model to {output_path}")
             os.makedirs(output_path, exist_ok=True)
             model.module.save_pretrained(output_path)
             tokenizer.save_pretrained(output_path)
-            print(f"Model saved to {output_path}")
+            logging.info(f"Model saved successfully to {output_path}")
 
     except Exception as e:
         print(f"Error on rank {rank}: {e}")
