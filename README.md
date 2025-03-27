@@ -1,4 +1,4 @@
-# KronA_finetuning
+# KoronA_finetuning
 KornA is a repository for fine-tuning and evaluating transformer-based models with Kronecker-based adapters (KronA). It supports tasks such as GLUE benchmarks and mathematical reasoning datasets, leveraging efficient and scalable adapter modules to enhance model performance.
 
 ## Features
